@@ -278,10 +278,18 @@ def render_ai_advisor(original_image: Image.Image) -> None:
             )
             return
 
+        model_name = st.selectbox(
+            "Modelo do Gemini",
+            options=config.GEMINI_MODEL_OPTIONS,
+            index=config.GEMINI_MODEL_OPTIONS.index(config.GEMINI_DEFAULT_MODEL),
+            help="Modelos 'flash' são mais rápidos e baratos; 'pro' tende a "
+            "dar uma análise mais detalhada, porém mais lenta.",
+        )
+
         if st.button("Analisar minha foto com IA"):
-            with st.spinner("Consultando o assistente de IA..."):
+            with st.spinner(f"Consultando o Gemini ({model_name})..."):
                 try:
-                    suggestions = ai_advisor.analyze_photo(original_image)
+                    suggestions = ai_advisor.analyze_photo(original_image, model_name=model_name)
                     st.markdown(suggestions)
                 except ai_advisor.AIAdvisorError as exc:
                     st.info(f"Não foi possível gerar sugestões agora: {exc}")
