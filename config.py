@@ -36,6 +36,18 @@ class AppConfig:
     OUTPUT_MAX_DIMENSION: int = 2000  # lado maior da imagem final, em px
     OUTPUT_JPEG_QUALITY: int = 95
 
+    # --- Limite de processamento interno (proteção de memória/tempo) ---
+    # A imagem de entrada é reduzida para no máximo este tamanho ANTES de
+    # passar pelo pipeline pesado (denoise, rembg). Isso evita que uma foto
+    # muito grande estoure a memória/tempo limitados do Streamlit Cloud.
+    MAX_PROCESSING_DIMENSION: int = 1600
+
+    # --- Preview rápido (ajustes ao vivo na sidebar) ---
+    PREVIEW_MAX_DIMENSION: int = 380
+
+    # --- Histórico de sessão ---
+    MAX_HISTORY_ITEMS: int = 5
+
     # --- Detecção de face (OpenCV Haar Cascade, embutido, sem download) ---
     FACE_CASCADE_SCALE_FACTOR: float = 1.1
     FACE_CASCADE_MIN_NEIGHBORS: int = 6
@@ -57,6 +69,16 @@ class AppConfig:
     STABILITY_API_KEY: str | None = field(
         default_factory=lambda: os.getenv("STABILITY_API_KEY")
     )
+
+    # --- IA de sugestão/análise (opcional, apenas texto — nunca edita pixels) ---
+    GEMINI_API_KEY: str | None = field(
+        default_factory=lambda: os.getenv("GEMINI_API_KEY")
+    )
+
+    @property
+    def ai_advisor_available(self) -> bool:
+        """Indica se a chave do Gemini foi configurada para o assistente de IA."""
+        return bool(self.GEMINI_API_KEY)
 
     @property
     def generative_api_available(self) -> bool:
