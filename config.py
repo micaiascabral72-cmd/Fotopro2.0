@@ -74,6 +74,13 @@ class AppConfig:
     GEMINI_API_KEY: str | None = field(
         default_factory=lambda: os.getenv("GEMINI_API_KEY")
     )
+    GEMINI_MODEL_OPTIONS: tuple[str, ...] = (
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-pro",
+    )
+    GEMINI_DEFAULT_MODEL: str = "gemini-3.6-flash"
 
     @property
     def ai_advisor_available(self) -> bool:
