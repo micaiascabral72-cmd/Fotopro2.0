@@ -154,17 +154,19 @@ def _get_face_cascade() -> cv2.CascadeClassifier:
     return _face_cascade
 
 
-def detect_primary_face(image: Image.Image) -> FaceBox:
-    """Detecta o rosto principal (maior) em uma imagem PIL.
+def detect_faces(image: Image.Image) -> list[FaceBox]:
+    """Detecta todos os rostos em uma imagem PIL, do maior para o menor.
+
+    Usado tanto pelo pipeline principal quanto pela UI, que pode pedir ao
+    usuário para escolher qual rosto é o dele quando há mais de uma pessoa
+    na foto.
 
     Args:
         image: Imagem PIL em modo RGB.
 
     Returns:
-        A caixa delimitadora (FaceBox) do maior rosto detectado.
-
-    Raises:
-        NoFaceDetectedError: Se nenhum rosto for encontrado na imagem.
+        Lista de `FaceBox`, ordenada da maior para a menor área. Lista
+        vazia se nenhum rosto for encontrado.
     """
     cascade = _get_face_cascade()
     gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
@@ -177,22 +179,64 @@ def detect_primary_face(image: Image.Image) -> FaceBox:
         minSize=config.FACE_CASCADE_MIN_SIZE,
     )
 
+    boxes = [FaceBox(x=int(x), y=int(y), w=int(w), h=int(h)) for x, y, w, h in faces]
+    boxes.sort(key=lambda box: box.w * box.h, reverse=True)
+    return boxes
+
+
+def detect_primary_face(image: Image.Image, face_index: int = 0) -> FaceBox:
+    """Detecta o(s) rosto(s) e retorna o escolhido pelo índice informado.
+
+    Args:
+        image: Imagem PIL em modo RGB.
+        face_index: Índice do rosto na lista ordenada por área (0 = maior
+            rosto detectado). Usado quando há múltiplas pessoas na foto e
+            o usuário escolheu manualmente qual é ele na UI.
+
+    Returns:
+        A caixa delimitadora (FaceBox) do rosto escolhido.
+
+    Raises:
+        NoFaceDetectedError: Se nenhum rosto for encontrado na imagem.
+    """
+    faces = detect_faces(image)
+
     if len(faces) == 0:
         raise NoFaceDetectedError(
             "Nenhum rosto foi identificado na foto. Envie uma imagem nítida, "
             "de frente, com boa iluminação e apenas uma pessoa em destaque."
         )
 
-    # Seleciona o maior rosto (em área), caso haja mais de uma pessoa na foto.
-    x, y, w, h = max(faces, key=lambda box: box[2] * box[3])
-    return FaceBox(x=int(x), y=int(y), w=int(w), h=int(h))
+    safe_index = face_index if 0 <= face_index < len(faces) else 0
+    return faces[safe_index]
 
 
 # --------------------------------------------------------------------------- #
 # 3. Remoção de fundo (rembg) — preserva 100% o sujeito
 # --------------------------------------------------------------------------- #
 
-def remove_background(image: Image.Image) -> Image.Image:
+def create_rembg_session():
+    """Cria uma sessão (modelo carregado) do `rembg` para ser reutilizada.
+
+    Carregar o modelo U^2-Net é a parte mais lenta do pipeline. Esta
+    função retorna um objeto de sessão que deve ser criado **uma única
+    vez** e reaproveitado entre chamadas — na aplicação Streamlit isso é
+    feito com `@st.cache_resource` (ver `app.py`), evitando recarregar o
+    modelo a cada foto processada.
+
+    Returns:
+        Uma sessão `rembg` pronta para uso, ou `None` se a biblioteca não
+        estiver disponível (nesse caso `remove_background` cai para o
+        modo sem sessão explícita).
+    """
+    try:
+        from rembg import new_session
+    except ImportError:
+        return None
+    return new_session("u2net")
+
+
+def remove_background(image: Image.Image, session=None) -> Image.Image:
     """Remove o fundo da imagem, retornando um PNG RGBA com alpha matting.
 
     Usa a biblioteca `rembg`, que segmenta o sujeito via rede neural
@@ -201,6 +245,9 @@ def remove_background(image: Image.Image) -> Image.Image:
 
     Args:
         image: Imagem PIL original (RGB).
+        session: Sessão `rembg` já carregada (ver `create_rembg_session`).
+            Se `None`, o `rembg` carrega o modelo internamente a cada
+            chamada — funciona, mas é mais lento.
 
     Returns:
         Imagem PIL em modo RGBA, com o fundo transparente.
@@ -219,7 +266,10 @@ def remove_background(image: Image.Image) -> Image.Image:
     try:
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
-        result_bytes = rembg_remove(buffer.getvalue())
+        if session is not None:
+            result_bytes = rembg_remove(buffer.getvalue(), session=session)
+        else:
+            result_bytes = rembg_remove(buffer.getvalue())
         subject_rgba = Image.open(io.BytesIO(result_bytes)).convert("RGBA")
     except Exception as exc:  # noqa: BLE001
         raise BackgroundRemovalError(
@@ -374,6 +424,88 @@ def enhance_lighting(
     return result
 
 
+def auto_white_balance(image: Image.Image) -> Image.Image:
+    """Corrige o balanço de branco usando o algoritmo Gray World.
+
+    Fotos de celular frequentemente têm um leve tom amarelado ou
+    azulado por causa da luz ambiente. Este ajuste normaliza a média de
+    cada canal de cor (R, G, B) para que fiquem próximas entre si,
+    deixando a cor da pele mais fiel — sem alterar geometria ou
+    textura, portanto sem risco para a identidade facial.
+
+    Args:
+        image: Imagem PIL RGB de entrada.
+
+    Returns:
+        Imagem PIL RGB com balanço de branco corrigido.
+    """
+    arr = np.array(image).astype(np.float32)
+    channel_means = arr.reshape(-1, 3).mean(axis=0)
+    overall_mean = channel_means.mean()
+
+    # Evita divisão por zero em imagens degeneradas (ex.: totalmente pretas).
+    safe_means = np.where(channel_means < 1e-3, overall_mean, channel_means)
+    gains = overall_mean / safe_means
+
+    # Limita o ganho para não gerar cores artificiais em fotos já neutras.
+    gains = np.clip(gains, 0.85, 1.15)
+
+    balanced = arr * gains
+    balanced = np.clip(balanced, 0, 255).astype(np.uint8)
+    return Image.fromarray(balanced)
+
+
+def apply_skin_smoothing(
+    image: Image.Image, face: Optional[FaceBox], strength: int
+) -> Image.Image:
+    """Suaviza sutilmente a pele do rosto, sem borrar cabelo/roupa/fundo.
+
+    Usa um filtro bilateral (preserva bordas nítidas, suaviza apenas
+    áreas de tom uniforme como a pele) aplicado à imagem inteira, mas
+    misturado de volta à imagem original apenas dentro de uma região
+    elíptica ao redor do rosto, com borda suavizada (feather). Isso
+    reduz brilho/oleosidade e pequenas imperfeições sem "plastificar"
+    o rosto nem alterar seus traços — cabelo, roupa e fundo permanecem
+    intocados.
+
+    Args:
+        image: Imagem PIL RGB (já composta com o novo fundo).
+        face: Caixa do rosto detectado, usada para localizar a região a
+            suavizar. Se `None`, a função retorna a imagem original
+            inalterada (não há como localizar a pele com segurança).
+        strength: Intensidade do efeito, de 0 (desligado) a 10 (máximo).
+
+    Returns:
+        Imagem PIL RGB com a suavização aplicada (ou a original, se
+        `strength == 0` ou nenhum rosto foi fornecido).
+    """
+    if strength <= 0 or face is None:
+        return image
+
+    arr = np.array(image)
+    height, width = arr.shape[:2]
+
+    # Filtro bilateral: suaviza tons uniformes mantendo bordas (olhos,
+    # sobrancelhas, contorno do nariz/boca) relativamente nítidas.
+    d = 9
+    sigma = 10 + strength * 4
+    smoothed = cv2.bilateralFilter(arr, d=d, sigmaColor=sigma, sigmaSpace=sigma)
+
+    # Máscara elíptica cobrindo a região do rosto, um pouco maior que a
+    # caixa detectada, com borda suave para uma transição imperceptível.
+    mask = np.zeros((height, width), dtype=np.float32)
+    center = face.center
+    axis_x = int(face.w * 0.75)
+    axis_y = int(face.h * 0.95)
+    cv2.ellipse(mask, center, (axis_x, axis_y), 0, 0, 360, 1.0, thickness=-1)
+    feather = max(3, min(axis_x, axis_y) // 4) | 1  # garante kernel ímpar
+    mask = cv2.GaussianBlur(mask, (feather, feather), 0)
+    mask_3ch = np.stack([mask] * 3, axis=-1)
+
+    blended = arr.astype(np.float32) * (1 - mask_3ch) + smoothed.astype(np.float32) * mask_3ch
+    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
+
+
 # --------------------------------------------------------------------------- #
 # 6. Redução de ruído (filtro clássico, não generativo)
 # --------------------------------------------------------------------------- #
@@ -463,6 +595,25 @@ def auto_crop_to_face(
 # 8. Redimensionamento final
 # --------------------------------------------------------------------------- #
 
+def downscale_for_processing(image: Image.Image, max_dimension: int) -> Image.Image:
+    """Reduz a imagem de entrada antes do pipeline pesado, se necessário.
+
+    Fotos muito grandes (ex.: 4000x3000 de uma câmera de celular) deixam
+    o `rembg` e os filtros do OpenCV lentos e consomem muita memória —
+    um risco real em ambientes com RAM limitada, como o Streamlit Cloud
+    gratuito. Esta função aplica o mesmo redimensionamento proporcional
+    de `resize_for_output`, mas como proteção de entrada.
+
+    Args:
+        image: Imagem PIL RGB original.
+        max_dimension: Tamanho máximo permitido para o lado maior.
+
+    Returns:
+        Imagem PIL RGB, redimensionada se estava acima do limite.
+    """
+    return resize_for_output(image, max_dimension)
+
+
 def resize_for_output(image: Image.Image, max_dimension: int) -> Image.Image:
     """Redimensiona a imagem final mantendo a proporção, sem upscaling forçado.
 
@@ -547,19 +698,26 @@ class ProcessingOptions:
     contrast: float = 1.08
     denoise_strength: int = 5
     auto_crop: bool = True
+    white_balance: bool = True
+    skin_smoothing: int = 0
+    face_index: int = 0
+    rembg_session: object = None
 
 
 def process_headshot(image: Image.Image, options: ProcessingOptions) -> Image.Image:
     """Executa o pipeline completo de headshot profissional.
 
     Ordem das operações (todas preservando a identidade facial):
-        1. Redução de ruído.
-        2. Detecção de rosto (necessária apenas se `auto_crop=True`).
-        3. Remoção de fundo.
-        4. Geração e composição do novo fundo.
-        5. Correção de iluminação/contraste.
-        6. Recorte automático centrado no rosto (opcional).
-        7. Redimensionamento final.
+        1. Redimensionamento de proteção (evita estourar memória/tempo).
+        2. Redução de ruído.
+        3. Correção de balanço de branco (opcional).
+        4. Detecção de rosto (necessária para recorte e suavização de pele).
+        5. Remoção de fundo.
+        6. Geração e composição do novo fundo.
+        7. Correção de iluminação/contraste.
+        8. Suavização de pele localizada no rosto (opcional).
+        9. Recorte automático centrado no rosto (opcional).
+        10. Redimensionamento final.
 
     Args:
         image: Imagem PIL RGB original, já validada.
@@ -571,21 +729,46 @@ def process_headshot(image: Image.Image, options: ProcessingOptions) -> Image.Im
     Raises:
         NoFaceDetectedError: Se `auto_crop=True` e nenhum rosto for encontrado.
         BackgroundRemovalError: Se a segmentação de fundo falhar.
-        ImageProcessingError: Para qualquer outra falha do pipeline.
+        ImageProcessingError: Para qualquer outra falha do pipeline (inclui
+            estouro de memória em imagens muito grandes).
     """
-    working_image = denoise_image(image, strength=options.denoise_strength)
+    try:
+        working_image = downscale_for_processing(image, config.MAX_PROCESSING_DIMENSION)
+        working_image = denoise_image(working_image, strength=options.denoise_strength)
 
-    face: Optional[FaceBox] = None
-    if options.auto_crop:
-        face = detect_primary_face(working_image)
+        if options.white_balance:
+            working_image = auto_white_balance(working_image)
 
-    subject_rgba = remove_background(working_image)
-    background = generate_background(options.background_style, subject_rgba.size)
-    composed = composite_with_background(subject_rgba, background)
+        # A detecção de rosto é usada tanto pelo recorte automático quanto
+        # pela suavização de pele localizada — só pula se ambos desligados.
+        face: Optional[FaceBox] = None
+        if options.auto_crop or options.skin_smoothing > 0:
+            try:
+                face = detect_primary_face(working_image, face_index=options.face_index)
+            except NoFaceDetectedError:
+                if options.auto_crop:
+                    raise
+                face = None  # suavização de pele simplesmente não é aplicada
 
-    lit = enhance_lighting(composed, brightness=options.brightness, contrast=options.contrast)
+        subject_rgba = remove_background(working_image, session=options.rembg_session)
+        background = generate_background(options.background_style, subject_rgba.size)
+        composed = composite_with_background(subject_rgba, background)
 
-    if options.auto_crop and face is not None:
-        lit = auto_crop_to_face(lit, face)
+        lit = enhance_lighting(
+            composed, brightness=options.brightness, contrast=options.contrast
+        )
 
-    return resize_for_output(lit, config.OUTPUT_MAX_DIMENSION)
+        if options.skin_smoothing > 0:
+            lit = apply_skin_smoothing(lit, face, strength=options.skin_smoothing)
+
+        if options.auto_crop and face is not None:
+            lit = auto_crop_to_face(lit, face)
+
+        return resize_for_output(lit, config.OUTPUT_MAX_DIMENSION)
+    except (NoFaceDetectedError, BackgroundRemovalError, GenerativeAPIError):
+        raise
+    except MemoryError as exc:
+        raise ImageProcessingError(
+            "A imagem é grande demais para ser processada com a memória "
+            "disponível. Tente enviar uma foto com resolução menor."
+        ) from exc
