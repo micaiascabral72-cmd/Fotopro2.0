@@ -19,8 +19,36 @@ from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
-# Carrega variáveis de um arquivo .env na raiz do projeto, se existir.
+# Carrega variáveis de um arquivo .env na raiz do projeto, se existir
+# (uso local). Em produção no Streamlit Cloud, isso é ignorado e as
+# chaves vêm de `st.secrets` (ver `_get_secret` abaixo).
 load_dotenv()
+
+
+def _get_secret(key: str) -> str | None:
+    """Busca uma chave/segredo, priorizando variáveis de ambiente (.env,
+    uso local) e caindo para `st.secrets` do Streamlit Cloud como
+    alternativa — assim a mesma chave funciona local ou publicada,
+    sem precisar duplicar configuração.
+
+    No painel do seu app em https://share.streamlit.io, vá em
+    "Settings" → "Secrets" e cole, por exemplo:
+
+        GEMINI_API_KEY = "sua-chave-aqui"
+
+    Salve e reinicie o app — não é necessário criar nenhum arquivo no
+    repositório para isso.
+    """
+    value = os.getenv(key)
+    if value:
+        return value
+
+    try:
+        import streamlit as st
+
+        return st.secrets.get(key)
+    except Exception:  # noqa: BLE001 - sem Streamlit rodando ou sem secrets.toml
+        return None
 
 
 @dataclass(frozen=True)
@@ -64,15 +92,15 @@ class AppConfig:
 
     # --- Integração opcional com API generativa (desativada por padrão) ---
     REPLICATE_API_TOKEN: str | None = field(
-        default_factory=lambda: os.getenv("REPLICATE_API_TOKEN")
+        default_factory=lambda: _get_secret("REPLICATE_API_TOKEN")
     )
     STABILITY_API_KEY: str | None = field(
-        default_factory=lambda: os.getenv("STABILITY_API_KEY")
+        default_factory=lambda: _get_secret("STABILITY_API_KEY")
     )
 
     # --- IA de sugestão/análise (opcional, apenas texto — nunca edita pixels) ---
     GEMINI_API_KEY: str | None = field(
-        default_factory=lambda: os.getenv("GEMINI_API_KEY")
+        default_factory=lambda: _get_secret("GEMINI_API_KEY")
     )
     GEMINI_MODEL_OPTIONS: tuple[str, ...] = (
         "gemini-3.6-flash",
