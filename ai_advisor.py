@@ -67,20 +67,25 @@ def _get_client():
     return genai
 
 
-def analyze_photo(image: Image.Image) -> str:
+def analyze_photo(image: Image.Image, model_name: str | None = None) -> str:
     """Envia a foto para o Gemini e retorna sugestões textuais de melhoria.
 
     Args:
         image: Imagem PIL RGB original (antes do processamento).
+        model_name: Nome do modelo Gemini a usar (ver
+            `config.GEMINI_MODEL_OPTIONS`). Se `None`, usa
+            `config.GEMINI_DEFAULT_MODEL`.
 
     Returns:
         Texto com as sugestões, em markdown simples (bullets).
 
     Raises:
         AIAdvisorError: Se a chave não estiver configurada, o SDK não
-            estiver instalado, ou a chamada à API falhar por qualquer motivo.
+            estiver instalado, ou a chamada à API falhar por qualquer motivo
+            (incluindo um nome de modelo inválido/indisponível).
     """
     genai = _get_client()
+    model_name = model_name or config.GEMINI_DEFAULT_MODEL
 
     # Reduz a imagem antes de enviar — economiza banda/tokens e é
     # suficiente para uma avaliação de luz/enquadramento/roupa.
@@ -92,7 +97,7 @@ def analyze_photo(image: Image.Image) -> str:
     prompt = _ANALYSIS_PROMPT.format(styles=", ".join(config.BACKGROUND_STYLES))
 
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel(model_name)
         response = model.generate_content(
             [
                 prompt,
@@ -101,10 +106,10 @@ def analyze_photo(image: Image.Image) -> str:
         )
         text = (response.text or "").strip()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Falha ao consultar o assistente de IA: %s", exc)
+        logger.warning("Falha ao consultar o assistente de IA (%s): %s", model_name, exc)
         raise AIAdvisorError(
-            "Não foi possível obter sugestões da IA agora. Tente novamente "
-            "mais tarde."
+            f"Não foi possível obter sugestões usando o modelo '{model_name}'. "
+            "Tente novamente ou escolha outro modelo."
         ) from exc
 
     if not text:
